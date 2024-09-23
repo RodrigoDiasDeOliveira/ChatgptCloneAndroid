@@ -1,0 +1,236 @@
+    script Terraform para criar uma infraestrutura na Oracle Cloud (para rodar o chattGPTClone)com um container, um load balancer,
+e os componentes necessários para rodar o aplicativo Android semelhante ao ChatGPT. O script irá configurar a rede, criar o container em uma instância de Oracle Container Engine for Kubernetes (OKE), adicionar um Load Balancer, e configurar a OCI Registry (OCIR) para hospedar a imagem do container.
+
+1. Configuração Inicial
+Antes de começar, você deve garantir que:
+
+Você tem uma conta Oracle Cloud com permissões para criar recursos.
+O Terraform CLI está instalado.
+Suas credenciais estão configuradas localmente para a Oracle Cloud.
+Você pode configurar suas credenciais no arquivo ~/.oci/config ou definir variáveis de ambiente para o Terraform usar as credenciais do Oracle Cloud.
+
+2. Estrutura do Terraform
+ criar o seguinte:
+
+Rede (VCN): Uma VCN com sub-redes para o Load Balancer e o Container.
+Load Balancer: Um balanceador de carga que direciona o tráfego para o cluster Kubernetes.
+Container: Um container executando sua aplicação.
+Registro de Imagens (OCIR): Para armazenar a imagem Docker.
+Diretório de Estrutura do Projeto
+css
+
+terraform/
+├── main.tf
+├── variables.tf
+└── outputs.tf
+
+3. Script Terraform
+variables.tf
+
+variable "compartment_ocid" {
+  description = "OCID do compartimento Oracle Cloud"
+  type        = string
+}
+
+variable "tenancy_ocid" {
+  description = "OCID da tenancy"
+  type        = string
+}
+
+variable "region" {
+  description = "Região onde os recursos serão provisionados"
+  default     = "us-ashburn-1"
+}
+
+variable "image_url" {
+  description = "URL da imagem Docker no Oracle Cloud Registry (OCIR)"
+  type        = string
+}
+
+variable "ssh_public_key" {
+  description = "Chave SSH pública para acessar instâncias"
+  type        = string
+}
+
+variable "oke_cluster_name" {
+  description = "Nome do cluster OKE"
+  default     = "chatgpt-cluster"
+}
+
+variable "load_balancer_name" {
+  description = "Nome do Load Balancer"
+  default     = "chatgpt-load-balancer"
+}
+main.tf
+
+provider "oci" {
+  tenancy_ocid = var.tenancy_ocid
+  region       = var.region
+}
+
+resource "oci_core_virtual_network" "vcn" {
+  compartment_id = var.compartment_ocid
+  display_name   = "chatgpt-vcn"
+  cidr_block     = "10.0.0.0/16"
+}
+
+resource "oci_core_subnet" "public_subnet" {
+  compartment_id      = var.compartment_ocid
+  vcn_id              = oci_core_virtual_network.vcn.id
+  display_name        = "public-subnet"
+  cidr_block          = "10.0.0.0/24"
+  availability_domain = data.oci_identity_availability_domains.ads.availability_domains[0].name
+  security_list_ids   = [oci_core_security_list.default.id]
+  route_table_id      = oci_core_route_table.default.id
+}
+
+resource "oci_core_internet_gateway" "internet_gateway" {
+  compartment_id = var.compartment_ocid
+  vcn_id         = oci_core_virtual_network.vcn.id
+  display_name   = "internet-gateway"
+  is_enabled     = true
+}
+
+resource "oci_core_route_table" "default" {
+  compartment_id = var.compartment_ocid
+  vcn_id         = oci_core_virtual_network.vcn.id
+
+  route_rules {
+    destination       = "0.0.0.0/0"
+    destination_type  = "CIDR_BLOCK"
+    network_entity_id = oci_core_internet_gateway.internet_gateway.id
+  }
+}
+
+resource "oci_core_security_list" "default" {
+  compartment_id = var.compartment_ocid
+  vcn_id         = oci_core_virtual_network.vcn.id
+
+  egress_security_rules {
+    protocol    = "all"
+    destination = "0.0.0.0/0"
+  }
+
+  ingress_security_rules {
+    protocol = "6"
+    source   = "0.0.0.0/0"
+    tcp_options {
+      "min" = 80
+      "max" = 80
+    }
+  }
+}
+
+resource "oci_containerengine_cluster" "oke_cluster" {
+  compartment_id   = var.compartment_ocid
+  name             = var.oke_cluster_name
+  vcn_id           = oci_core_virtual_network.vcn.id
+  kubernetes_version = "v1.23.5"
+
+  options {
+    add_ons {
+      is_kubernetes_dashboard_enabled = false
+      is_tiller_enabled = false
+    }
+  }
+
+  endpoint_config {
+    is_public_ip_enabled = true
+  }
+
+  node_pools {
+    node_shape = "VM.Standard.E3.Flex"
+    initial_node_labels {
+      key = "role"
+      value = "worker"
+    }
+  }
+}
+
+resource "oci_load_balancer_load_balancer" "lb" {
+  compartment_id = var.compartment_ocid
+  display_name   = var.load_balancer_name
+  shape          = "100Mbps"
+  subnet_ids     = [oci_core_subnet.public_subnet.id]
+
+  backend_sets {
+    name = "backend-set-1"
+    policy = "ROUND_ROBIN"
+
+    health_checker {
+      protocol = "HTTP"
+      url_path = "/"
+      port = 80
+    }
+
+    backends {
+      ip_address = oci_containerengine_cluster.oke_cluster.endpoints.kubernetes
+      port       = 80
+    }
+  }
+
+  listeners {
+    name           = "http-listener"
+    protocol       = "HTTP"
+    port           = 80
+    default_backend_set_name = "backend-set-1"
+  }
+}
+
+resource "oci_artifacts_container_repository" "ocir_repository" {
+  compartment_id = var.compartment_ocid
+  display_name   = "chatgpt-repo"
+  is_immutable   = false
+  is_public      = false
+}
+
+output "oke_cluster_kubeconfig" {
+  value = oci_containerengine_cluster.oke_cluster.endpoints.kubernetes
+  description = "O endpoint de API Kubernetes do cluster."
+}
+outputs.tf
+hcl
+
+output "vcn_id" {
+  description = "ID da VCN criada"
+  value       = oci_core_virtual_network.vcn.id
+}
+
+output "public_subnet_id" {
+  description = "ID da sub-rede pública criada"
+  value       = oci_core_subnet.public_subnet.id
+}
+
+output "load_balancer_ip" {
+  description = "IP do Load Balancer"
+  value       = oci_load_balancer_load_balancer.lb.ip_addresses[0].ip_address
+}
+4. Passos para Implantar a Infraestrutura
+Configure suas credenciais Oracle Cloud no arquivo ~/.oci/config.
+
+Preencha o arquivo variables.tf com os valores apropriados, como o compartment_ocid e a URL da imagem Docker.
+
+Inicialize o Terraform no diretório onde você salvou os arquivos:
+
+bash
+
+terraform init
+Revise e aplique o plano Terraform:
+
+bash
+
+terraform plan
+Se o plano parecer bom, aplique as mudanças:
+
+bash
+
+terraform apply
+Implante o aplicativo no Kubernetes: Após a criação do cluster OKE, use o kubectl para gerenciar seu cluster Kubernetes, onde o container será executado.
+
+bash
+
+kubectl apply -f deployment.yaml
+Aqui você pode criar um arquivo deployment.yaml para descrever o deployment do container, que estará armazenado no OCIR.
+
+Este script cria toda a infraestrutura necessária para hospedar seu aplicativo baseado no ChatGPT na Oracle Cloud,
+incluindo uma rede VCN, um cluster Kubernetes (OKE), um balanceador de carga (LB), e um repositório de imagens Docker (OCIR).
