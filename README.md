@@ -1,4 +1,4 @@
-# ChatgptCloneAndoid
+# ChatgptCloneAndroid
 estudos sobre um clone do chatgpt para android
 aplicativo Android que:
 
